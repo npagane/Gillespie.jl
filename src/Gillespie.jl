@@ -11,6 +11,7 @@ export
     gillespie,
     jensen,
     truejump,
+    nonmarkov,
     ssa_data,
     pfsample,
     SSAArgs,
@@ -30,13 +31,13 @@ This function performs stochastic simulation, currently using either the Doob-Gi
 
 There are several named arguments:
 
-- **algo**: the algorithm to use (`Symbol`, either `:gillespie` (default), ':jensen', or ':tjm').
+- **algo**: the algorithm to use (`Symbol`, either `:gillespie` (default), ':jensen', ':tjm', or ':nonmarkov').
 - **max_rate**: the maximum rate (`Float64`, for Jensen's method only).
 - **thin**: (`Bool`) whether to thin jumps for Jensens method (default: `true`).
 
 "
 function ssa(x0::AbstractVector{Int64},F::Base.Callable,nu::AbstractMatrix{Int64},parms::AbstractVector{Float64},tf::Float64; algo=:gillespie, max_rate::Float64=0.0, thin::Bool=true)
-  @assert algo in [:gillespie,:jensen,:tjm] "Available algorithms are :gillespie, :jensen, and :tjm"
+  @assert algo in [:gillespie,:jensen,:tjm, :nonmarkov] "Available algorithms are :gillespie, :jensen, :tjm, and :nonmarkov"
   if algo == :gillespie
     return gillespie(x0,F,nu,parms,tf)
   end
@@ -45,6 +46,9 @@ function ssa(x0::AbstractVector{Int64},F::Base.Callable,nu::AbstractMatrix{Int64
   end
   if algo == :tjm
     return tjm(x0,F,nu,parms,tf)
+  end
+  if algo == :nonmarkov
+    return nonmarkov(x0,F,nu,parms,tf)
   end
 end
 

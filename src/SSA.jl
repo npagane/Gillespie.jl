@@ -45,6 +45,90 @@ struct SSAResult
     args::SSAArgs
 end
 
+"
+This function calculates the survival probability of a process `ψᵢ` occuring after time `τ`
+"
+survival(ψᵢ::Distribution{ArrayLikeVariate{0}, Continuous}, τ::Float64) = 1.0 - cdf(ψᵢ, τ)
+
+"
+This function defines the conditional survival probability of a process `ψᵢ` at elapsed time `tᵢ` occuring after time `τ` 
+"
+survival(ψᵢ::Distribution{ArrayLikeVariate{0}, Continuous}, τ::Float64, tᵢ::Float64) = survival(ψᵢ, τ + tᵢ) / survival(ψᵢ, tᵢ) 
+
+"
+This function defines the probability of `τ`, i.e. the probability that no reaction `ψₖ` occurs between any `tₖ + τ`
+"
+function survival(ψₖ::AbstractArray{<:Distribution, 1}, τ::Float64, tₖ::AbstractArray{Float64,1}, n::Int64)
+    Φ = 1
+    for j in 1:n
+        @inbounds Φ *= survival(ψₖ[j], τ + tₖ[j]) / survival(ψₖ[j], tₖ[j])
+    end
+    return Φ
+end
+
+" 
+This function defines the joint probability that given times `tₖ` elapsed since the last occurence of each process up to a given point in time `t`,
+    the next event taking place corresponds to process `ψᵢ` and will occur at time  `t + τ`
+"
+function joint(i::Int64, ψₖ::AbstractArray{<:Distribution, 1}, τ::Float64, tₖ::AbstractArray{Float64,1}, n::Int64) 
+    return pdf(ψₖ[i], τ + tₖ[i]) / survival(ψₖ[i], τ + tₖ[i]) * survival(ψₖ, τ, tₖ, n)
+end
+
+" 
+This process defines the instantaneous (hazard) rate of process `ψᵢ` at time `τ`
+"
+hazard(ψᵢ::Distribution{ArrayLikeVariate{0}, Continuous}, τ::Float64) = pdf(ψᵢ, τ) / survival(ψᵢ, τ)
+
+"
+This function defines the probability that the next event belongs to process `ψᵢ` given the occurrence time `τ`
+"
+function process(i::Int64, ψₖ::AbstractArray{<:Distribution, 1}, τ::Float64, tₖ::AbstractArray{Float64,1}, n::Int64)
+    # calculate 
+    Π = 0
+    for j in 1:n
+        @inbounds Π += hazard(ψₖ[j], tₖ[j] + τ)
+    end
+    return hazard(ψₖ[i], tₖ[i] + τ) / Π
+end
+
+"
+This function calculates the exact sampling of the next event `ψᵢ` at `τ = 0`
+"
+function process_sample(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64)
+    # make empirical pdf
+    empdf = [process(i, ψₖ, 0.0, tₖ, n) for i in 1:n]
+    sumpdf = sum(empdf)
+    # solve Π(i, ψ, 0, t, n) = u to get new event i 
+    i = pfsample(empdf,sumpdf,n)
+    return i
+end
+
+"
+This funtion calculates the exact (albeit numerical) sampling of the survival probability of `τ`.
+The default stepsize `h₀ = 1e-5` and the adaptive selection of `h` could be improved.
+"
+function survival_sample_exact(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64; h₀ = 1e-5, h₁ = 10)
+    hmin = maximum(@SVector [minimum(tₖ), h₀])
+    hmax = maximum(@SVector [maximum(tₖ), h₁])
+    τrange = hmin:hmin:hmax
+    # make empirical pdf
+    empdf = [survival(ψₖ, τ, tₖ, n) for τ in τrange]
+    sumpdf = sum(empdf)
+    # solve Θ(ψ, τ, t, n) = u to get new time τ
+    i = pfsample(empdf,sumpdf,length(τrange))
+    return τrange[i]
+end
+
+"
+This funtion calculates the `n>>1` sampling approximation of the survival probability of `τ` 
+"
+function survival_sample_approx(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64)
+    Φ = 0
+    for j in 1:n
+        @inbounds Φ += hazard(ψₖ[j], tₖ[j])
+    end
+    return rand(Exponential(1/Φ))
+end
 
 "
 This function is a substitute for `StatsBase.sample(wv::WeightVec)`, which avoids recomputing the sum and size of the weight vector, as well as a type conversion of the propensity vector. It takes the following arguments:
@@ -330,6 +414,62 @@ function jensen_alljumps(x0::AbstractVector{Int64},F::Base.Callable,nu::Abstract
           end
         end
         k +=1
+    end
+    stats = SSAStats(termination_status,nsteps)
+    xar = transpose(reshape(xa,length(x),nsteps+1))
+    return SSAResult(ta,xar,stats,args)
+end
+
+"
+This function performs the generalized Gillespie (non-Markovian) stochastic simulation algorithm. 
+It takes the following arguments:
+
+- **x0** : a `Vector` of `Int64`, representing the initial states of the system.
+- **F** : a `Function` or a callable type, which itself takes two arguments; x, a `Vector` of `Int64` representing the states, and parms, a `Vector` of `Float64` representing the parameters of the system.
+- **nu** : a `Matrix` of `Int64`, representing the transitions of the system, organised by row.
+- **ψₖ** : a `Vector` of `Distribution` representing the response times of the system.
+- **tf** : the final simulation time (`Float64`).
+"
+function nonmarkov(x0::AbstractVector{Int64},F::Base.Callable,nu::AbstractMatrix{Int64},parms::AbstractVector{Float64},tf::Float64)
+    # Args
+    args = SSAArgs(x0,F,nu,parms,tf,:nonmarkov,false)
+    # Set up time and elapsed time arrays
+    ta = Vector{Float64}()
+    n = size(nu,1)
+    tₖ = zeros(n)
+    t = 0.0
+    push!(ta,t)
+    # Set up initial x
+    nstates = length(x0)
+    x = copy(x0')
+    xa = copy(Array(x0))
+    # Main loop
+    termination_status = "finaltime"
+    nsteps = 0
+    while t <= tf
+        ψₖ=F(x,parms)
+        # Update time
+        dt = survival_sample_exact(ψₖ, tₖ, n)
+        t += dt
+        push!(ta,t)
+        # Update event
+        ev = process_sample(ψₖ, tₖ, n)
+        if x isa SVector
+            @inbounds x[1] += nu[ev,:]
+        else
+            deltax = view(nu,ev,:)
+            for i in 1:nstates
+                @inbounds x[1,i] += deltax[i]
+            end
+        end
+        for xx in x
+            push!(xa,xx)
+        end
+        # update elapsed times of all processes
+        tₖ[1:end .!= ev] .+= dt
+        tₖ[ev] = 0
+        # update nsteps
+        nsteps += 1
     end
     stats = SSAStats(termination_status,nsteps)
     xar = transpose(reshape(xa,length(x),nsteps+1))
