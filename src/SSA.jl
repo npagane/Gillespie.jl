@@ -94,7 +94,7 @@ end
 "
 This function calculates the exact sampling of the next event `ψᵢ` at `τ = 0`
 "
-function process_sample(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64)
+function process_sample_exact(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64, ignore_index::Int64)
     # make empirical pdf
     empdf = [process(i, ψₖ, 0.0, tₖ, n) for i in 1:n]
     sumpdf = sum(empdf)
@@ -104,15 +104,34 @@ function process_sample(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractA
 end
 
 "
+This function calculates the exact sampling of the next event `ψᵢ` at `τ = 0`
+"
+function process_sample_approx(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64, ignore_index::Int64)
+    # make empirical pdf
+    empdf = [process(i, ψₖ, 0.0, tₖ, n) for i in 1:n]
+    sumpdf = sum(empdf)
+    # solve Π(i, ψ, 0, t, n) = u to get new event i 
+    i = ignore_index
+    while i == ignore_index
+        i = pfsample(empdf,sumpdf,n)
+    end
+    return i
+end
+
+"
 This funtion calculates the exact (albeit numerical) sampling of the survival probability of `τ`.
 The default stepsize `h₀ = 1e-5` and the adaptive selection of `h` could be improved.
 "
-function survival_sample_exact(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64; h₀ = 1e-5, h₁ = 10)
-    hmin = maximum(@SVector [minimum(tₖ), h₀])
-    hmax = maximum(@SVector [maximum(tₖ), h₁])
-    τrange = hmin:hmin:hmax
-    # make empirical pdf
-    empdf = [survival(ψₖ, τ, tₖ, n) for τ in τrange]
+function survival_sample_exact(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64; h₀ = 1e-5, cutoff = 1e-3)
+    h = maximum(@SVector [minimum(tₖ)/n, h₀])
+    empdf = Vector{Float64}()
+    τrange = Vector{Float64}()
+    push!(empdf, survival(ψₖ, h, tₖ, n))
+    push!(τrange, h)
+    while empdf[end] > cutoff
+        push!(τrange, τrange[end]+h)
+        push!(empdf, survival(ψₖ, τrange[end], tₖ, n))
+    end
     sumpdf = sum(empdf)
     # solve Θ(ψ, τ, t, n) = u to get new time τ
     i = pfsample(empdf,sumpdf,length(τrange))
@@ -120,7 +139,7 @@ function survival_sample_exact(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::Ab
 end
 
 "
-This funtion calculates the `n>>1` sampling approximation of the survival probability of `τ` 
+This funtion calculates the `n→∞` sampling approximation of the survival probability of `τ` 
 "
 function survival_sample_approx(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64)
     Φ = 0
@@ -430,7 +449,7 @@ It takes the following arguments:
 - **ψₖ** : a `Vector` of `Distribution` representing the response times of the system.
 - **tf** : the final simulation time (`Float64`).
 "
-function nonmarkov(x0::AbstractVector{Int64},F::Base.Callable,nu::AbstractMatrix{Int64},parms::AbstractVector{Float64},tf::Float64)
+function nonmarkov(x0::AbstractVector{Int64},F::Base.Callable,nu::AbstractMatrix{Int64},parms::AbstractVector{Float64},tf::Float64; napprox = 50)
     # Args
     args = SSAArgs(x0,F,nu,parms,tf,:nonmarkov,false)
     # Set up time and elapsed time arrays
@@ -446,14 +465,49 @@ function nonmarkov(x0::AbstractVector{Int64},F::Base.Callable,nu::AbstractMatrix
     # Main loop
     termination_status = "finaltime"
     nsteps = 0
-    while t <= tf
+    # warm up (get every process sampled so that tₖ vector is not zeros)
+    while t <= tf || sum(tₖ .== 0) > 1
         ψₖ=F(x,parms)
         # Update time
         dt = survival_sample_exact(ψₖ, tₖ, n)
         t += dt
         push!(ta,t)
         # Update event
-        ev = process_sample(ψₖ, tₖ, n)
+        ev = process_sample_exact(ψₖ, tₖ, n, 0)
+        if x isa SVector
+            @inbounds x[1] += nu[ev,:]
+        else
+            deltax = view(nu,ev,:)
+            for i in 1:nstates
+                @inbounds x[1,i] += deltax[i]
+            end
+        end
+        for xx in x
+            push!(xa,xx)
+        end
+        # update elapsed times of all processes
+        tₖ[1:end .!= ev] .+= dt
+        tₖ[ev] = 0
+        # update nsteps
+        nsteps += 1
+    end
+    # determine whether the number of processes is in the approximation limit
+    if n > napprox
+        survival_sampler = survival_sample_approx
+        process_sampler = process_sample_approx
+    else
+        survival_sampler = survival_sample_exact
+        process_sampler = process_sample_exact
+    end
+    # continue sampling but potentially with approx function
+    while t <= tf
+        ψₖ=F(x,parms)
+        # Update time
+        dt = survival_sampler(ψₖ, tₖ, n)
+        t += dt
+        push!(ta,t)
+        # Update event
+        ev = process_sampler(ψₖ, tₖ, n, ev)
         if x isa SVector
             @inbounds x[1] += nu[ev,:]
         else
