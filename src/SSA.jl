@@ -94,9 +94,9 @@ end
 "
 This function calculates the exact sampling of the next event `ψᵢ` at `τ = 0`
 "
-function process_sample_exact(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64, ignore_index::Int64)
+function process_sample_exact(ψₖ::AbstractArray{<:Distribution, 1}, τ::Float64, tₖ::AbstractArray{Float64,1}, n::Int64, ignore_index::Int64)
     # make empirical pdf
-    empdf = [process(i, ψₖ, 0.0, tₖ, n) for i in 1:n]
+    empdf = [process(i, ψₖ, τ, tₖ, n) for i in 1:n]
     sumpdf = sum(empdf)
     # solve Π(i, ψ, 0, t, n) = u to get new event i 
     i = pfsample(empdf,sumpdf,n)
@@ -106,7 +106,7 @@ end
 "
 This function calculates the exact sampling of the next event `ψᵢ` at `τ = 0`
 "
-function process_sample_approx(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64, ignore_index::Int64)
+function process_sample_approximate(ψₖ::AbstractArray{<:Distribution, 1}, τ::Float64, tₖ::AbstractArray{Float64,1}, n::Int64, ignore_index::Int64)
     # make empirical pdf
     empdf = [process(i, ψₖ, 0.0, tₖ, n) for i in 1:n]
     sumpdf = sum(empdf)
@@ -122,16 +122,18 @@ end
 This funtion calculates the exact (albeit numerical) sampling of the survival probability of `τ`.
 The default stepsize `h₀ = 1e-5` and the adaptive selection of `h` could be improved.
 "
-function survival_sample_exact(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64; h₀ = 1e-5, cutoff = 1e-3)
-    h = maximum(@SVector [minimum(tₖ)/n, h₀])
-    empdf = Vector{Float64}()
-    τrange = Vector{Float64}()
-    push!(empdf, survival(ψₖ, h, tₖ, n))
-    push!(τrange, h)
-    while empdf[end] > cutoff
-        push!(τrange, τrange[end]+h)
-        push!(empdf, survival(ψₖ, τrange[end], tₖ, n))
+function survival_sample_exact(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64; h = 1e-8, cutoff = 1e-3)
+    # find intital time starting point and bin size h
+    while 1 - survival(ψₖ, h, tₖ, n) < cutoff
+        h *= 2
     end
+    # determine size of array for given h
+    nsize = 2
+    while survival(ψₖ, nsize*h, tₖ, n) > cutoff
+        nsize *= 2
+    end
+    τrange = h:h:nsize*h
+    empdf = [survival(ψₖ, τ, tₖ, n) for τ in τrange]
     sumpdf = sum(empdf)
     # solve Θ(ψ, τ, t, n) = u to get new time τ
     i = pfsample(empdf,sumpdf,length(τrange))
@@ -141,7 +143,7 @@ end
 "
 This funtion calculates the `n→∞` sampling approximation of the survival probability of `τ` 
 "
-function survival_sample_approx(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64)
+function survival_sample_approximate(ψₖ::AbstractArray{<:Distribution, 1}, tₖ::AbstractArray{Float64,1}, n::Int64)
     Φ = 0
     for j in 1:n
         @inbounds Φ += hazard(ψₖ[j], tₖ[j])
@@ -464,16 +466,20 @@ function nonmarkov(x0::AbstractVector{Int64},F::Base.Callable,nu::AbstractMatrix
     xa = copy(Array(x0))
     # Main loop
     termination_status = "finaltime"
-    nsteps = 0
+    nsteps = 0; ev = 0
     # warm up (get every process sampled so that tₖ vector is not zeros)
-    while t <= tf || sum(tₖ .== 0) > 1
-        ψₖ=F(x,parms)
+    while t <= tf && sum(tₖ .== 0) > 1
+        ψₖ=F(x,parms,t,tₖ)
+        if sum(survival.(ψₖ, Inf) .!= 0) == n
+            termination_status = "zeroprop"
+            break
+        end
         # Update time
         dt = survival_sample_exact(ψₖ, tₖ, n)
         t += dt
         push!(ta,t)
         # Update event
-        ev = process_sample_exact(ψₖ, tₖ, n, 0)
+        ev = process_sample_exact(ψₖ, dt, tₖ, n, 0)
         if x isa SVector
             @inbounds x[1] += nu[ev,:]
         else
@@ -501,13 +507,17 @@ function nonmarkov(x0::AbstractVector{Int64},F::Base.Callable,nu::AbstractMatrix
     end
     # continue sampling but potentially with approx function
     while t <= tf
-        ψₖ=F(x,parms)
+        ψₖ=F(x,parms,t,tₖ)
+        if sum(survival.(ψₖ, Inf) .!= 0) == n
+            termination_status = "zeroprop"
+            break
+        end
         # Update time
         dt = survival_sampler(ψₖ, tₖ, n)
         t += dt
         push!(ta,t)
         # Update event
-        ev = process_sampler(ψₖ, tₖ, n, ev)
+        ev = process_sampler(ψₖ, dt, tₖ, n, ev)
         if x isa SVector
             @inbounds x[1] += nu[ev,:]
         else
