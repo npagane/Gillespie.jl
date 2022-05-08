@@ -499,8 +499,8 @@ function nonmarkov(x0::AbstractVector{Int64},F::Base.Callable,nu::AbstractMatrix
     end
     # determine whether the number of processes is in the approximation limit
     if n > napprox
-        survival_sampler = survival_sample_approx
-        process_sampler = process_sample_approx
+        survival_sampler = survival_sample_approximate
+        process_sampler = process_sample_approximate
     else
         survival_sampler = survival_sample_exact
         process_sampler = process_sample_exact
